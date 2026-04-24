@@ -4,7 +4,6 @@ on:
   workflow_call:
     inputs:
       environment:
-        description: "Environment label (dev or prod)"
         required: true
         type: string
     secrets:
@@ -21,57 +20,41 @@ jobs:
   snyk:
     name: "[${{ inputs.environment }}] Snyk Dependency Scan"
     runs-on: ubuntu-latest
-    continue-on-error: true   # ← TEMPORARY: remove this for strict production gates
+    # continue-on-error: true  ← UNCOMMENT to make pipeline non-blocking
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Run Snyk Scan (capture output + JSON report)
-        id: snyk
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
         run: |
-          npm install -g snyk
-          snyk auth ${{ secrets.SNYK_TOKEN }}
-
-          # Run scan — capture human-readable output
-          snyk test \
-            --severity-threshold=high \
-            --json-file-output=snyk-report.json \
-            > snyk-output.txt 2>&1 || true
-
-          # Parse counts from JSON
-          TOTAL=$(cat snyk-report.json | python3 -c "
-          import json,sys
-          data=json.load(sys.stdin)
-          vulns = data.get('vulnerabilities', [])
-          high = sum(1 for v in vulns if v.get('severity') in ['high','critical'])
-          total = len(vulns)
-          print(f'TOTAL={total}')
-          print(f'HIGH={high}')
-          " 2>/dev/null || echo "TOTAL=N/A
-          HIGH=N/A")
-          echo "$TOTAL" >> $GITHUB_ENV
-          echo "$HIGH" >> $GITHUB_ENV
-
-          # Determine result
-          if grep -q '"ok": true' snyk-report.json 2>/dev/null; then
-            echo "snyk_status=PASSED" >> $GITHUB_OUTPUT
-          else
-            echo "snyk_status=VULNERABILITIES_FOUND" >> $GITHUB_OUTPUT
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
           fi
+
+      - name: Run Snyk Scan
+        id: snyk
+        uses: snyk/actions/python-3.10@master
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        continue-on-error: true
+        with:
+          args: --severity-threshold=high
 
-      - name: Upload Snyk Report as Artifact
+      - name: Upload Snyk Report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: snyk-report-${{ github.event.repository.name }}-${{ github.run_number }}
-          path: |
-            snyk-report.json
-            snyk-output.txt
+          path: snyk.json
           retention-days: 30
+        continue-on-error: true
 
-      - name: Email — Snyk Report
+      - name: Email — Snyk PASSED
+        if: success()
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -80,40 +63,46 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_RECIPIENT }}
           from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "${{ steps.snyk.outputs.snyk_status == 'PASSED' && '✅' || '⚠️' }} [Snyk][${{ inputs.environment }}] ${{ github.event.repository.name }} — ${{ steps.snyk.outputs.snyk_status }}"
+          subject: "✅ [Snyk][${{ inputs.environment }}] PASSED — ${{ github.event.repository.name }}"
           body: |
             ══════════════════════════════════════════
             WASHIFY CI/CD — SNYK DEPENDENCY REPORT
             ══════════════════════════════════════════
+            Result      : ✅ NO HIGH/CRITICAL VULNERABILITIES
+            Service     : ${{ github.event.repository.name }}
+            Environment : ${{ inputs.environment }}
+            Branch      : ${{ github.ref_name }}
+            Commit      : ${{ github.sha }}
 
-            Service       : ${{ github.event.repository.name }}
-            Environment   : ${{ inputs.environment }}
-            Branch        : ${{ github.ref_name }}
-            Commit        : ${{ github.sha }}
-            Triggered by  : ${{ github.actor }}
-            Result        : ${{ steps.snyk.outputs.snyk_status }}
-
-            ──────────────────────────────────────────
-            📊 VULNERABILITY SUMMARY
-            ──────────────────────────────────────────
-            Total Vulnerabilities : ${{ env.TOTAL }}
-            High/Critical         : ${{ env.HIGH }}
-            Threshold             : HIGH and above
-
-            ──────────────────────────────────────────
-            📎 FULL REPORT
-            ──────────────────────────────────────────
-            The detailed snyk-report.json and snyk-output.txt
-            are available as GitHub Actions Artifacts:
+            Full report artifact available at:
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            ──────────────────────────────────────────
-            ⚙️  PIPELINE STATUS
-            ──────────────────────────────────────────
-            The pipeline is CONTINUING to Stage 3 (Docker Build + Trivy).
-            NOTE: Snyk is in REPORT-ONLY mode.
-            To enforce gate, remove continue-on-error from reusable-snyk.yml
+            Pipeline proceeding to Stage 3 (Build + Trivy + GHCR Push).
+            ══════════════════════════════════════════
+            — Washify CI/CD
 
+      - name: Email — Snyk FAILED
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.MAIL_RECIPIENT }}
+          from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
+          subject: "❌ [Snyk][${{ inputs.environment }}] FAILED — ${{ github.event.repository.name }}"
+          body: |
             ══════════════════════════════════════════
-            — Washify CI/CD Automated Report
+            WASHIFY CI/CD — SNYK DEPENDENCY REPORT
             ══════════════════════════════════════════
+            Result      : ❌ HIGH/CRITICAL VULNERABILITIES FOUND — PIPELINE STOPPED
+            Service     : ${{ github.event.repository.name }}
+            Environment : ${{ inputs.environment }}
+            Branch      : ${{ github.ref_name }}
+            Commit      : ${{ github.sha }}
+
+            Action: Run 'snyk test' locally and fix all HIGH/CRITICAL issues.
+            Report: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            ══════════════════════════════════════════
+            — Washify CI/CD

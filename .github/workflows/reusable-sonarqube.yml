@@ -4,7 +4,6 @@ on:
   workflow_call:
     inputs:
       environment:
-        description: "Environment label (dev or prod)"
         required: true
         type: string
     secrets:
@@ -23,7 +22,7 @@ jobs:
   sonarqube:
     name: "[${{ inputs.environment }}] SonarQube Quality Gate"
     runs-on: ubuntu-latest
-    continue-on-error: true   # ← TEMPORARY: remove this for strict production gates
+    # continue-on-error: true  ← UNCOMMENT this line to make pipeline non-blocking
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -33,7 +32,6 @@ jobs:
       - name: Run SonarQube Scan
         id: scan
         uses: sonarsource/sonarqube-scan-action@master
-        continue-on-error: true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
@@ -41,24 +39,13 @@ jobs:
       - name: Check Quality Gate Status
         id: quality_gate
         uses: sonarsource/sonarqube-quality-gate-action@master
-        continue-on-error: true
         timeout-minutes: 5
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-      - name: Set Result
-        id: result
-        run: |
-          if [[ "${{ steps.scan.outcome }}" == "failure" ]]; then
-            echo "status=CONNECTION_FAILED" >> $GITHUB_OUTPUT
-          elif [[ "${{ steps.quality_gate.outcome }}" == "failure" ]]; then
-            echo "status=QUALITY_GATE_FAILED" >> $GITHUB_OUTPUT
-          else
-            echo "status=PASSED" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Email — SonarQube Report
+      - name: Email — SonarQube PASSED
+        if: success()
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -67,40 +54,50 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_RECIPIENT }}
           from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "${{ steps.result.outputs.status == 'PASSED' && '✅' || '⚠️' }} [SonarQube][${{ inputs.environment }}] ${{ github.event.repository.name }} — ${{ steps.result.outputs.status }}"
+          subject: "✅ [SonarQube][${{ inputs.environment }}] PASSED — ${{ github.event.repository.name }}"
           body: |
             ══════════════════════════════════════════
             WASHIFY CI/CD — SONARQUBE REPORT
             ══════════════════════════════════════════
-
+            Result      : ✅ QUALITY GATE PASSED
             Service     : ${{ github.event.repository.name }}
             Environment : ${{ inputs.environment }}
             Branch      : ${{ github.ref_name }}
             Commit      : ${{ github.sha }}
             Triggered by: ${{ github.actor }}
-            Result      : ${{ steps.result.outputs.status }}
 
-            ──────────────────────────────────────────
-            📊 SONARQUBE DASHBOARD (Full Report)
-            ──────────────────────────────────────────
+            📊 Full Report:
             ${{ secrets.SONAR_HOST_URL }}/dashboard?id=washify-${{ github.event.repository.name }}
 
-            ──────────────────────────────────────────
-            📌 WHAT TO CHECK IN DASHBOARD:
-            ──────────────────────────────────────────
-            • Bugs          → should be 0
-            • Vulnerabilities → should be 0
-            • Code Smells   → review and fix
-            • Coverage      → aim for > 70%
-            • Duplications  → keep < 3%
-
-            ──────────────────────────────────────────
-            ⚙️  PIPELINE STATUS
-            ──────────────────────────────────────────
-            The pipeline is CONTINUING to Stage 2 (Snyk).
-            NOTE: SonarQube is in REPORT-ONLY mode.
-            To enforce gate, remove continue-on-error from reusable-sonarqube.yml
-
+            Pipeline proceeding to Stage 2 (Snyk).
             ══════════════════════════════════════════
-            — Washify CI/CD Automated Report
+            — Washify CI/CD
+
+      - name: Email — SonarQube FAILED
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.MAIL_RECIPIENT }}
+          from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
+          subject: "❌ [SonarQube][${{ inputs.environment }}] FAILED — ${{ github.event.repository.name }}"
+          body: |
             ══════════════════════════════════════════
+            WASHIFY CI/CD — SONARQUBE REPORT
+            ══════════════════════════════════════════
+            Result      : ❌ QUALITY GATE FAILED — PIPELINE STOPPED
+            Service     : ${{ github.event.repository.name }}
+            Environment : ${{ inputs.environment }}
+            Branch      : ${{ github.ref_name }}
+            Commit      : ${{ github.sha }}
+            Triggered by: ${{ github.actor }}
+
+            📊 Fix issues here:
+            ${{ secrets.SONAR_HOST_URL }}/dashboard?id=washify-${{ github.event.repository.name }}
+
+            Action: Fix all code quality issues before pushing again.
+            ══════════════════════════════════════════
+            — Washify CI/CD
