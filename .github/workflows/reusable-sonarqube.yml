@@ -1,8 +1,3 @@
-# ─────────────────────────────────────────────────────────────
-# REUSABLE WORKFLOW: Stage 1 — SonarQube Code Quality Gate
-# Repo: WashifyApp/washify-workflows
-# Called by: each microservice's ci-dev.yml / ci-prod.yml
-# ─────────────────────────────────────────────────────────────
 name: Reusable — SonarQube Quality Gate
 
 on:
@@ -28,7 +23,7 @@ jobs:
   sonarqube:
     name: "[${{ inputs.environment }}] SonarQube Quality Gate"
     runs-on: ubuntu-latest
-    continue-on-error: true   # pipeline proceeds even if SonarQube fails
+    continue-on-error: true   # ← TEMPORARY: remove this for strict production gates
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -36,7 +31,9 @@ jobs:
           fetch-depth: 0
 
       - name: Run SonarQube Scan
+        id: scan
         uses: sonarsource/sonarqube-scan-action@master
+        continue-on-error: true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
@@ -44,13 +41,24 @@ jobs:
       - name: Check Quality Gate Status
         id: quality_gate
         uses: sonarsource/sonarqube-quality-gate-action@master
+        continue-on-error: true
         timeout-minutes: 5
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-      - name: Email — Quality Gate PASSED
-        if: success()
+      - name: Set Result
+        id: result
+        run: |
+          if [[ "${{ steps.scan.outcome }}" == "failure" ]]; then
+            echo "status=CONNECTION_FAILED" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.quality_gate.outcome }}" == "failure" ]]; then
+            echo "status=QUALITY_GATE_FAILED" >> $GITHUB_OUTPUT
+          else
+            echo "status=PASSED" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Email — SonarQube Report
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -59,45 +67,40 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_RECIPIENT }}
           from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "✅ [${{ inputs.environment }}][PASS] SonarQube — ${{ github.repository }}"
+          subject: "${{ steps.result.outputs.status == 'PASSED' && '✅' || '⚠️' }} [SonarQube][${{ inputs.environment }}] ${{ github.event.repository.name }} — ${{ steps.result.outputs.status }}"
           body: |
-            Hello Dev Team,
+            ══════════════════════════════════════════
+            WASHIFY CI/CD — SONARQUBE REPORT
+            ══════════════════════════════════════════
 
-            ✅ SonarQube Quality Gate PASSED
-
-            Service    : ${{ github.repository }}
-            Environment: ${{ inputs.environment }}
-            Branch/Tag : ${{ github.ref_name }}
-            Commit     : ${{ github.sha }}
+            Service     : ${{ github.event.repository.name }}
+            Environment : ${{ inputs.environment }}
+            Branch      : ${{ github.ref_name }}
+            Commit      : ${{ github.sha }}
             Triggered by: ${{ github.actor }}
+            Result      : ${{ steps.result.outputs.status }}
 
-            The pipeline is moving to Stage 2 (Snyk Scan).
+            ──────────────────────────────────────────
+            📊 SONARQUBE DASHBOARD (Full Report)
+            ──────────────────────────────────────────
+            ${{ secrets.SONAR_HOST_URL }}/dashboard?id=washify-${{ github.event.repository.name }}
 
-            — Washify CI/CD
+            ──────────────────────────────────────────
+            📌 WHAT TO CHECK IN DASHBOARD:
+            ──────────────────────────────────────────
+            • Bugs          → should be 0
+            • Vulnerabilities → should be 0
+            • Code Smells   → review and fix
+            • Coverage      → aim for > 70%
+            • Duplications  → keep < 3%
 
-      - name: Email — Quality Gate FAILED
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          to: ${{ secrets.MAIL_RECIPIENT }}
-          from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "❌ [${{ inputs.environment }}][FAIL] SonarQube — ${{ github.repository }}"
-          body: |
-            Hello Dev Team,
+            ──────────────────────────────────────────
+            ⚙️  PIPELINE STATUS
+            ──────────────────────────────────────────
+            The pipeline is CONTINUING to Stage 2 (Snyk).
+            NOTE: SonarQube is in REPORT-ONLY mode.
+            To enforce gate, remove continue-on-error from reusable-sonarqube.yml
 
-            ❌ SonarQube Quality Gate FAILED — Pipeline Stopped
-
-            Service    : ${{ github.repository }}
-            Environment: ${{ inputs.environment }}
-            Branch/Tag : ${{ github.ref_name }}
-            Commit     : ${{ github.sha }}
-            Triggered by: ${{ github.actor }}
-
-            Action Required: Fix all code quality issues before pushing again.
-            SonarQube Dashboard: ${{ secrets.SONAR_HOST_URL }}
-
-            — Washify CI/CD
+            ══════════════════════════════════════════
+            — Washify CI/CD Automated Report
+            ══════════════════════════════════════════

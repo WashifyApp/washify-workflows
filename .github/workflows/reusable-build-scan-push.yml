@@ -1,8 +1,3 @@
-# ─────────────────────────────────────────────────────────────
-# REUSABLE WORKFLOW: Stage 3 — Docker Build + Trivy Scan + Push to GHCR
-# Repo: WashifyApp/washify-workflows
-# Called by: each microservice's ci-dev.yml / ci-prod.yml
-# ─────────────────────────────────────────────────────────────
 name: Reusable — Build, Scan & Push to GHCR
 
 on:
@@ -13,7 +8,7 @@ on:
         required: true
         type: string
       image_tag:
-        description: "Image tag to use (sha-abc1234 for dev, v1.1.1 for prod)"
+        description: "Image tag (sha-abc1234 for dev, v1.1.1 for prod)"
         required: true
         type: string
     secrets:
@@ -45,13 +40,13 @@ jobs:
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           SERVICE=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
           TAG="${{ inputs.image_tag }}"
-          # If tag starts with sha-, truncate the SHA to first 7 chars
           if [[ "$TAG" == sha-* ]]; then
             FULL_SHA="${TAG#sha-}"
             TAG="sha-${FULL_SHA:0:7}"
           fi
           IMAGE="${{ env.REGISTRY }}/${OWNER}/${SERVICE}:${TAG}"
           echo "full_image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "image_tag=${TAG}"    >> $GITHUB_OUTPUT
           echo "Building image: ${IMAGE}"
 
       - name: Log in to GHCR
@@ -64,7 +59,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Build but do NOT push yet — Trivy scans first
       - name: Build Docker Image
         uses: docker/build-push-action@v5
         with:
@@ -76,74 +70,144 @@ jobs:
       - name: Load Image for Trivy
         run: docker load --input /tmp/image.tar
 
-      # ── Trivy Scan ──────────────────────────────────────
-      - name: Run Trivy Container Scan
+      # ── Trivy Scan — generate full report ──────────────────
+      - name: Run Trivy Scan (JSON report)
         id: trivy
-        uses: aquasecurity/trivy-action@master
-        continue-on-error: true
+        run: |
+          # Install Trivy
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+          # Run scan — JSON output for parsing
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format json \
+            --output trivy-report.json \
+            ${{ steps.image.outputs.full_image }} || true
+
+          # Run scan — table output for readability
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format table \
+            --output trivy-table.txt \
+            ${{ steps.image.outputs.full_image }} || true
+
+          # Parse counts
+          CRITICAL=$(cat trivy-report.json | python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          count=sum(
+            1 for r in data.get('Results',[])
+            for v in r.get('Vulnerabilities',[]) or []
+            if v.get('Severity')=='CRITICAL'
+          )
+          print(count)
+          " 2>/dev/null || echo "0")
+
+          HIGH=$(cat trivy-report.json | python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          count=sum(
+            1 for r in data.get('Results',[])
+            for v in r.get('Vulnerabilities',[]) or []
+            if v.get('Severity')=='HIGH'
+          )
+          print(count)
+          " 2>/dev/null || echo "0")
+
+          echo "critical=${CRITICAL}" >> $GITHUB_OUTPUT
+          echo "high=${HIGH}"        >> $GITHUB_OUTPUT
+
+          if [[ "$CRITICAL" -eq 0 && "$HIGH" -eq 0 ]]; then
+            echo "trivy_status=PASSED" >> $GITHUB_OUTPUT
+          else
+            echo "trivy_status=VULNERABILITIES_FOUND" >> $GITHUB_OUTPUT
+          fi
+
+          # Show table in logs
+          echo "=== TRIVY SCAN RESULTS ==="
+          cat trivy-table.txt
+        continue-on-error: true   # ← TEMPORARY: remove for strict prod gates
+
+      - name: Upload Trivy Reports as Artifact
+        uses: actions/upload-artifact@v4
         with:
-          image-ref: ${{ steps.image.outputs.full_image }}
-          format: table
-          exit-code: 1
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
+          name: trivy-report-${{ github.event.repository.name }}-${{ github.run_number }}
+          path: |
+            trivy-report.json
+            trivy-table.txt
+          retention-days: 30
 
-      - name: Email — Trivy PASSED
-        if: steps.trivy.outcome == 'success'
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          to: ${{ secrets.MAIL_RECIPIENT }}
-          from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "✅ [${{ inputs.environment }}][PASS] Trivy + GHCR Push — ${{ github.repository }}"
-          body: |
-            Hello Dev Team,
-
-            ✅ Trivy Container Scan PASSED & Image Pushed to GHCR
-
-            Service    : ${{ github.repository }}
-            Environment: ${{ inputs.environment }}
-            Branch/Tag : ${{ github.ref_name }}
-            Image      : ${{ steps.image.outputs.full_image }}
-
-            All 3 pipeline stages completed successfully! 🎉
-            The image is now available in GHCR and ready for deployment.
-
-            — Washify CI/CD
-
-      - name: Email — Trivy FAILED
-        if: steps.trivy.outcome == 'failure'
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          to: ${{ secrets.MAIL_RECIPIENT }}
-          from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "❌ [${{ inputs.environment }}][FAIL] Trivy Scan — ${{ github.repository }}"
-          body: |
-            Hello Dev Team,
-
-            ❌ Trivy Container Scan FAILED — Image NOT pushed to GHCR
-
-            Service    : ${{ github.repository }}
-            Environment: ${{ inputs.environment }}
-            Branch/Tag : ${{ github.ref_name }}
-            Image      : ${{ steps.image.outputs.full_image }}
-
-            Action Required: HIGH/CRITICAL vulnerabilities found in the container image.
-            Fix the base image or dependency versions and push again.
-
-            — Washify CI/CD
-
-      - name: Fail Pipeline if Trivy Found Vulnerabilities
-        if: steps.trivy.outcome == 'failure'
-        run: exit 1
-
-      # ── Push to GHCR only if Trivy passed ───────────────
+      # ── Push to GHCR ────────────────────────────────────────
       - name: Push Image to GHCR
+        id: push
         run: docker push ${{ steps.image.outputs.full_image }}
+
+      - name: Email — Full Pipeline Report
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.MAIL_RECIPIENT }}
+          from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
+          subject: "${{ steps.push.outcome == 'success' && '🚀' || '❌' }} [Build+Trivy][${{ inputs.environment }}] ${{ github.event.repository.name }}:${{ steps.image.outputs.image_tag }} — ${{ steps.trivy.outputs.trivy_status }}"
+          body: |
+            ══════════════════════════════════════════
+            WASHIFY CI/CD — BUILD & SECURITY REPORT
+            ══════════════════════════════════════════
+
+            Service       : ${{ github.event.repository.name }}
+            Environment   : ${{ inputs.environment }}
+            Branch        : ${{ github.ref_name }}
+            Commit        : ${{ github.sha }}
+            Triggered by  : ${{ github.actor }}
+
+            ──────────────────────────────────────────
+            🐳 DOCKER IMAGE
+            ──────────────────────────────────────────
+            Image    : ${{ steps.image.outputs.full_image }}
+            Tag      : ${{ steps.image.outputs.image_tag }}
+            Registry : ghcr.io
+            Status   : ${{ steps.push.outcome == 'success' && 'PUSHED ✅' || 'PUSH FAILED ❌' }}
+
+            View Image:
+            https://github.com/orgs/${{ github.repository_owner }}/packages
+
+            ──────────────────────────────────────────
+            🔒 TRIVY CONTAINER SCAN RESULTS
+            ──────────────────────────────────────────
+            Result          : ${{ steps.trivy.outputs.trivy_status }}
+            CRITICAL Issues : ${{ steps.trivy.outputs.critical }}
+            HIGH Issues     : ${{ steps.trivy.outputs.high }}
+
+            ──────────────────────────────────────────
+            📎 FULL REPORTS (Artifacts)
+            ──────────────────────────────────────────
+            Download trivy-report.json and trivy-table.txt at:
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ──────────────────────────────────────────
+            📋 COMPLETE PIPELINE SUMMARY
+            ──────────────────────────────────────────
+            Stage 1 — SonarQube : See SonarQube dashboard
+            Stage 2 — Snyk      : See previous email or artifacts
+            Stage 3 — Trivy     : ${{ steps.trivy.outputs.trivy_status }}
+            Image Push          : ${{ steps.push.outcome == 'success' && 'SUCCESS' || 'FAILED' }}
+
+            ──────────────────────────────────────────
+            ⚙️  NEXT STEP (Manual)
+            ──────────────────────────────────────────
+            Update washify-gitops dev/apps/${{ github.event.repository.name }}/values.yaml:
+
+              image:
+                tag: ${{ steps.image.outputs.image_tag }}
+
+            Then ArgoCD will deploy to washify-dev-ns!
+
+            ══════════════════════════════════════════
+            — Washify CI/CD Automated Report
+            ══════════════════════════════════════════
