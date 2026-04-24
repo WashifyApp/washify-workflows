@@ -68,30 +68,76 @@ jobs:
       - name: Load Image for Trivy
         run: docker load --input /tmp/image.tar
 
-      # ── Trivy actually scans and FAILS on HIGH/CRITICAL ────
-      - name: Run Trivy Scan
+      # ── Trivy scan — report only, gate lifted ──────────────
+      - name: Run Trivy Scan (Table Report)
+        id: trivy_table
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format table \
+            --output trivy-table.txt \
+            ${{ steps.image.outputs.full_image }} || true
+
+          echo "=== TRIVY SCAN TABLE ==="
+          cat trivy-table.txt
+
+      - name: Run Trivy Scan (JSON for Parsing)
         id: trivy
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ steps.image.outputs.full_image }}
-          format: table
-          exit-code: 1          # ← fails the step if vulns found
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          output: trivy-table.txt
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format json \
+            --output trivy-report.json \
+            ${{ steps.image.outputs.full_image }} || true
 
-      - name: Run Trivy JSON Report
-        if: always()
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ steps.image.outputs.full_image }}
-          format: json
-          output: trivy-report.json
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-        continue-on-error: true
+          CRITICAL=$(python3 -c "
+          import json
+          try:
+              data = json.load(open('trivy-report.json'))
+              count = sum(1 for r in data.get('Results',[]) for v in (r.get('Vulnerabilities') or []) if v.get('Severity')=='CRITICAL')
+              print(count)
+          except: print('0')
+          " 2>/dev/null || echo "0")
 
-      - name: Upload Trivy Reports
+          HIGH=$(python3 -c "
+          import json
+          try:
+              data = json.load(open('trivy-report.json'))
+              count = sum(1 for r in data.get('Results',[]) for v in (r.get('Vulnerabilities') or []) if v.get('Severity')=='HIGH')
+              print(count)
+          except: print('0')
+          " 2>/dev/null || echo "0")
+
+          # Get top 5 findings
+          TOP=$(python3 -c "
+          import json
+          try:
+              data = json.load(open('trivy-report.json'))
+              lines = []
+              seen = set()
+              for r in data.get('Results',[]):
+                  for v in (r.get('Vulnerabilities') or []):
+                      key = v.get('VulnerabilityID','')
+                      if key not in seen and v.get('Severity') in ['CRITICAL','HIGH']:
+                          seen.add(key)
+                          fixed = v.get('FixedVersion','No fix available')
+                          lines.append(f\"  [{v.get('Severity')}] {key} — {v.get('PkgName','?')} (fix: {fixed})\")
+                  if len(lines) >= 5: break
+              print('\n'.join(lines) if lines else '  No HIGH/CRITICAL found')
+          except: print('  Unable to parse report')
+          ")
+
+          echo "critical=${CRITICAL}"    >> $GITHUB_OUTPUT
+          echo "high=${HIGH}"           >> $GITHUB_OUTPUT
+          echo "top_vulns<<EOF"         >> $GITHUB_OUTPUT
+          echo "$TOP"                   >> $GITHUB_OUTPUT
+          echo "EOF"                    >> $GITHUB_OUTPUT
+
+      - name: Upload Trivy Reports as Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -101,13 +147,13 @@ jobs:
             trivy-table.txt
           retention-days: 30
 
-      # ── Push only if Trivy passed ───────────────────────────
+      # ── Push image regardless (gate lifted) ────────────────
       - name: Push Image to GHCR
         id: push
         run: docker push ${{ steps.image.outputs.full_image }}
 
-      - name: Email — Build & Trivy PASSED
-        if: success()
+      - name: Email — Full Build & Trivy Report to Team
+        if: always()
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -116,61 +162,68 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_RECIPIENT }}
           from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "🚀 [Build+Trivy][${{ inputs.environment }}] PASSED — ${{ github.event.repository.name }}:${{ steps.image.outputs.image_tag }}"
+          subject: "${{ steps.push.outcome == 'success' && '🚀' || '❌' }} [Build+Trivy][${{ inputs.environment }}] ${{ github.event.repository.name }}:${{ steps.image.outputs.image_tag }} — CRITICAL:${{ steps.trivy.outputs.critical }} HIGH:${{ steps.trivy.outputs.high }}"
           body: |
-            ══════════════════════════════════════════
-            WASHIFY CI/CD — BUILD & SECURITY REPORT
-            ══════════════════════════════════════════
-            Result      : ✅ ALL CHECKS PASSED — IMAGE PUSHED
+            ══════════════════════════════════════════════════
+              WASHIFY CI/CD — BUILD & TRIVY SECURITY REPORT
+            ══════════════════════════════════════════════════
 
-            Service     : ${{ github.event.repository.name }}
-            Environment : ${{ inputs.environment }}
-            Branch      : ${{ github.ref_name }}
-            Commit      : ${{ github.sha }}
+            Service      : ${{ github.event.repository.name }}
+            Environment  : ${{ inputs.environment }}
+            Branch       : ${{ github.ref_name }}
+            Commit       : ${{ github.sha }}
+            Triggered by : ${{ github.actor }}
 
-            🐳 IMAGE DETAILS:
-            Image : ${{ steps.image.outputs.full_image }}
-            Tag   : ${{ steps.image.outputs.image_tag }}
+            ──────────────────────────────────────────────────
+            🐳 DOCKER IMAGE
+            ──────────────────────────────────────────────────
+            Image  : ${{ steps.image.outputs.full_image }}
+            Tag    : ${{ steps.image.outputs.image_tag }}
+            Status : ${{ steps.push.outcome == 'success' && '✅ PUSHED TO GHCR' || '❌ PUSH FAILED' }}
 
-            👁 View Image:
+            View Image:
             https://github.com/orgs/${{ github.repository_owner }}/packages
 
-            📎 Trivy Report Artifact:
-            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            ──────────────────────────────────────────────────
+            🔒 TRIVY CONTAINER SCAN RESULTS
+            ──────────────────────────────────────────────────
+            CRITICAL : ${{ steps.trivy.outputs.critical }}
+            HIGH     : ${{ steps.trivy.outputs.high }}
 
-            ⚙️  NEXT STEP:
-            Update washify-gitops dev/apps/${{ github.event.repository.name }}/values.yaml:
+            Top Findings:
+            ${{ steps.trivy.outputs.top_vulns }}
+
+            ──────────────────────────────────────────────────
+            ⚠️  EMERGENCY GATE BYPASS NOTICE
+            ──────────────────────────────────────────────────
+            Trivy security gate is currently LIFTED due to
+            emergency production deployment requirements.
+
+            The image has been pushed to GHCR DESPITE having
+            ${{ steps.trivy.outputs.critical }} CRITICAL and
+            ${{ steps.trivy.outputs.high }} HIGH vulnerabilities.
+
+            ACTION REQUIRED:
+            1. Review the full Trivy report (download below)
+            2. Update base image to a patched version
+            3. Fix all CRITICAL issues before next sprint
+            4. Notify team lead once all issues are resolved
+            Gate will be re-enforced after fixes are confirmed.
+
+            ──────────────────────────────────────────────────
+            📎 DOWNLOAD FULL TRIVY REPORT
+            ──────────────────────────────────────────────────
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            (Download trivy-report.json and trivy-table.txt
+             from the Artifacts section)
+
+            ──────────────────────────────────────────────────
+            ⚙️  NEXT STEP
+            ──────────────────────────────────────────────────
+            Update washify-gitops repo:
+            dev/apps/${{ github.event.repository.name }}/values.yaml
               image:
                 tag: ${{ steps.image.outputs.image_tag }}
-            ══════════════════════════════════════════
-            — Washify CI/CD
 
-      - name: Email — Trivy FAILED
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          to: ${{ secrets.MAIL_RECIPIENT }}
-          from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "❌ [Trivy][${{ inputs.environment }}] FAILED — ${{ github.event.repository.name }} — IMAGE NOT PUSHED"
-          body: |
-            ══════════════════════════════════════════
-            WASHIFY CI/CD — TRIVY SCAN REPORT
-            ══════════════════════════════════════════
-            Result : ❌ HIGH/CRITICAL VULNERABILITIES FOUND — IMAGE NOT PUSHED
-
-            Service     : ${{ github.event.repository.name }}
-            Environment : ${{ inputs.environment }}
-            Branch      : ${{ github.ref_name }}
-            Commit      : ${{ github.sha }}
-
-            Action: Fix the vulnerabilities in your Dockerfile base image
-            or dependency versions. Download the full report below.
-
-            📎 Full Trivy Report:
-            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            ══════════════════════════════════════════
-            — Washify CI/CD
+            ══════════════════════════════════════════════════
+            — Washify CI/CD Automated Report

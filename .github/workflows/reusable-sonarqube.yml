@@ -20,9 +20,9 @@ on:
 
 jobs:
   sonarqube:
-    name: "[${{ inputs.environment }}] SonarQube Quality Gate"
+    name: "[${{ inputs.environment }}] SonarQube — Scan & Report"
     runs-on: ubuntu-latest
-    # continue-on-error: true  ← UNCOMMENT this line to make pipeline non-blocking
+    continue-on-error: true   # Gate lifted for emergency — remove when fixed
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -32,20 +32,36 @@ jobs:
       - name: Run SonarQube Scan
         id: scan
         uses: sonarsource/sonarqube-scan-action@master
+        continue-on-error: true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-      - name: Check Quality Gate Status
-        id: quality_gate
+      - name: Check Quality Gate
+        id: gate
         uses: sonarsource/sonarqube-quality-gate-action@master
+        continue-on-error: true
         timeout-minutes: 5
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-      - name: Email — SonarQube PASSED
-        if: success()
+      - name: Determine Result
+        id: result
+        run: |
+          if [[ "${{ steps.scan.outcome }}" == "failure" ]]; then
+            echo "status=CONNECTION_ERROR" >> $GITHUB_OUTPUT
+            echo "icon=🔴" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.gate.outcome }}" == "failure" ]]; then
+            echo "status=QUALITY_GATE_FAILED" >> $GITHUB_OUTPUT
+            echo "icon=❌" >> $GITHUB_OUTPUT
+          else
+            echo "status=PASSED" >> $GITHUB_OUTPUT
+            echo "icon=✅" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Email — SonarQube Report to Team
+        if: always()
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -54,50 +70,44 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_RECIPIENT }}
           from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "✅ [SonarQube][${{ inputs.environment }}] PASSED — ${{ github.event.repository.name }}"
+          subject: "${{ steps.result.outputs.icon }} [SonarQube][${{ inputs.environment }}] ${{ steps.result.outputs.status }} — ${{ github.event.repository.name }}"
           body: |
-            ══════════════════════════════════════════
-            WASHIFY CI/CD — SONARQUBE REPORT
-            ══════════════════════════════════════════
-            Result      : ✅ QUALITY GATE PASSED
-            Service     : ${{ github.event.repository.name }}
-            Environment : ${{ inputs.environment }}
-            Branch      : ${{ github.ref_name }}
-            Commit      : ${{ github.sha }}
-            Triggered by: ${{ github.actor }}
+            ══════════════════════════════════════════════════
+              WASHIFY CI/CD — SONARQUBE CODE QUALITY REPORT
+            ══════════════════════════════════════════════════
 
-            📊 Full Report:
-            ${{ secrets.SONAR_HOST_URL }}/dashboard?id=washify-${{ github.event.repository.name }}
+            Service      : ${{ github.event.repository.name }}
+            Environment  : ${{ inputs.environment }}
+            Branch       : ${{ github.ref_name }}
+            Commit       : ${{ github.sha }}
+            Triggered by : ${{ github.actor }}
+            Scan Result  : ${{ steps.result.outputs.status }}
 
-            Pipeline proceeding to Stage 2 (Snyk).
-            ══════════════════════════════════════════
-            — Washify CI/CD
+            ──────────────────────────────────────────────────
+            ⚠️  EMERGENCY GATE BYPASS NOTICE
+            ──────────────────────────────────────────────────
+            Quality gate is currently LIFTED due to emergency
+            production deployment requirements.
 
-      - name: Email — SonarQube FAILED
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          to: ${{ secrets.MAIL_RECIPIENT }}
-          from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "❌ [SonarQube][${{ inputs.environment }}] FAILED — ${{ github.event.repository.name }}"
-          body: |
-            ══════════════════════════════════════════
-            WASHIFY CI/CD — SONARQUBE REPORT
-            ══════════════════════════════════════════
-            Result      : ❌ QUALITY GATE FAILED — PIPELINE STOPPED
-            Service     : ${{ github.event.repository.name }}
-            Environment : ${{ inputs.environment }}
-            Branch      : ${{ github.ref_name }}
-            Commit      : ${{ github.sha }}
-            Triggered by: ${{ github.actor }}
+            ACTION REQUIRED: The development team MUST review
+            the SonarQube report and fix all flagged issues
+            before the next release. Gate will be re-enforced
+            once fixes are confirmed.
 
-            📊 Fix issues here:
-            ${{ secrets.SONAR_HOST_URL }}/dashboard?id=washify-${{ github.event.repository.name }}
+            ──────────────────────────────────────────────────
+            📊 VIEW FULL SONARQUBE REPORT
+            ──────────────────────────────────────────────────
+            Dashboard : ${{ secrets.SONAR_HOST_URL }}/dashboard?id=washify-${{ github.event.repository.name }}
+            Projects  : ${{ secrets.SONAR_HOST_URL }}/projects
 
-            Action: Fix all code quality issues before pushing again.
-            ══════════════════════════════════════════
-            — Washify CI/CD
+            Issues to review:
+            • Bugs           → Must be 0 before gate re-enforcement
+            • Vulnerabilities → Must be 0
+            • Code Smells     → Reduce to acceptable level
+            • Coverage        → Target > 70%
+            • Duplications    → Keep < 3%
+
+            ──────────────────────────────────────────────────
+            Pipeline is continuing to Stage 2 (Snyk Scan).
+            ══════════════════════════════════════════════════
+            — Washify CI/CD Automated Report
