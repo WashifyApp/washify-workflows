@@ -42,7 +42,15 @@ jobs:
       - name: Set Full Image Name
         id: image
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ inputs.image_tag }}"
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          SERVICE=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          TAG="${{ inputs.image_tag }}"
+          # If tag starts with sha-, truncate the SHA to first 7 chars
+          if [[ "$TAG" == sha-* ]]; then
+            FULL_SHA="${TAG#sha-}"
+            TAG="sha-${FULL_SHA:0:7}"
+          fi
+          IMAGE="${{ env.REGISTRY }}/${OWNER}/${SERVICE}:${TAG}"
           echo "full_image=${IMAGE}" >> $GITHUB_OUTPUT
           echo "Building image: ${IMAGE}"
 
