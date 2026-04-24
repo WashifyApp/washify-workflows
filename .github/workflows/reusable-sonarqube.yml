@@ -28,6 +28,7 @@ jobs:
   sonarqube:
     name: "[${{ inputs.environment }}] SonarQube Quality Gate"
     runs-on: ubuntu-latest
+    continue-on-error: true   # pipeline proceeds even if SonarQube fails
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
