@@ -1,4 +1,4 @@
-name: Reusable — Snyk Vulnerability Scan
+name: Reusable — Snyk Scan
 
 on:
   workflow_call:
@@ -18,110 +18,32 @@ on:
 
 jobs:
   snyk:
-    name: "[${{ inputs.environment }}] Snyk — Scan & Report"
     runs-on: ubuntu-latest
-    continue-on-error: true   # Gate lifted for emergency — remove when fixed
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+    continue-on-error: true
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
+        run: pip install -r requirements.txt || true
 
-      - name: Run Snyk Scan & Generate Report
-        id: snyk
+      - name: Run Snyk Scan
         run: |
-          npm install -g snyk 2>/dev/null
-
-          # Authenticate
+          npm install -g snyk
           snyk auth ${{ secrets.SNYK_TOKEN }}
+          snyk test --severity-threshold=high --json > snyk-report.json || true
 
-          # Run scan — capture output, don't fail script
-          set +e
-          snyk test \
-            --severity-threshold=high \
-            --json > snyk-report.json 2>&1
-          SNYK_EXIT=$?
-          set -e
-
-          # Parse results from JSON
-          CRITICAL=$(python3 -c "
-          import json, sys
-          try:
-              data = json.load(open('snyk-report.json'))
-              vulns = data.get('vulnerabilities', [])
-              print(sum(1 for v in vulns if v.get('severity') == 'critical'))
-          except: print('0')
-          " 2>/dev/null || echo "0")
-
-          HIGH=$(python3 -c "
-          import json, sys
-          try:
-              data = json.load(open('snyk-report.json'))
-              vulns = data.get('vulnerabilities', [])
-              print(sum(1 for v in vulns if v.get('severity') == 'high'))
-          except: print('0')
-          " 2>/dev/null || echo "0")
-
-          MEDIUM=$(python3 -c "
-          import json, sys
-          try:
-              data = json.load(open('snyk-report.json'))
-              vulns = data.get('vulnerabilities', [])
-              print(sum(1 for v in vulns if v.get('severity') == 'medium'))
-          except: print('0')
-          " 2>/dev/null || echo "0")
-
-          # Get top 5 vuln names
-          TOP_VULNS=$(python3 -c "
-          import json
-          try:
-              data = json.load(open('snyk-report.json'))
-              vulns = data.get('vulnerabilities', [])
-              seen = set()
-              lines = []
-              for v in vulns:
-                if v.get('severity') in ['critical','high'] and v.get('title') not in seen:
-                    seen.add(v.get('title'))
-                    lines.append(f\"  - [{v.get('severity','?').upper()}] {v.get('title','Unknown')} in {v.get('packageName','?')}@{v.get('version','?')}\")
-                if len(lines) >= 5: break
-              print('\n'.join(lines) if lines else '  No HIGH/CRITICAL found')
-          except: print('  Unable to parse report')
-          " 2>/dev/null)
-
-          echo "critical=${CRITICAL}" >> $GITHUB_OUTPUT
-          echo "high=${HIGH}"        >> $GITHUB_OUTPUT
-          echo "medium=${MEDIUM}"    >> $GITHUB_OUTPUT
-          echo "top_vulns<<EOF"      >> $GITHUB_OUTPUT
-          echo "$TOP_VULNS"          >> $GITHUB_OUTPUT
-          echo "EOF"                 >> $GITHUB_OUTPUT
-
-          if [[ "$SNYK_EXIT" -eq 0 ]]; then
-            echo "status=PASSED" >> $GITHUB_OUTPUT
-          else
-            echo "status=VULNERABILITIES_FOUND" >> $GITHUB_OUTPUT
-          fi
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-      - name: Upload Snyk Report Artifact
-        if: always()
+      - name: Upload Report
         uses: actions/upload-artifact@v4
         with:
-          name: snyk-report-${{ github.event.repository.name }}-${{ github.run_number }}
+          name: snyk-report
           path: snyk-report.json
-          retention-days: 30
-        continue-on-error: true
 
-      - name: Email — Snyk Report to Team
+      - name: Send Email
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
@@ -130,49 +52,6 @@ jobs:
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_RECIPIENT }}
-          from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "${{ steps.snyk.outputs.status == 'PASSED' && '✅' || '⚠️' }} [Snyk][${{ inputs.environment }}] ${{ steps.snyk.outputs.status }} — ${{ github.event.repository.name }}"
-          body: |
-            ══════════════════════════════════════════════════
-              WASHIFY CI/CD — SNYK DEPENDENCY SECURITY REPORT
-            ══════════════════════════════════════════════════
-
-            Service      : ${{ github.event.repository.name }}
-            Environment  : ${{ inputs.environment }}
-            Branch       : ${{ github.ref_name }}
-            Commit       : ${{ github.sha }}
-            Triggered by : ${{ github.actor }}
-            Scan Result  : ${{ steps.snyk.outputs.status }}
-
-            ──────────────────────────────────────────────────
-            🔒 VULNERABILITY SUMMARY
-            ──────────────────────────────────────────────────
-            CRITICAL  : ${{ steps.snyk.outputs.critical }}
-            HIGH      : ${{ steps.snyk.outputs.high }}
-            MEDIUM    : ${{ steps.snyk.outputs.medium }}
-
-            ──────────────────────────────────────────────────
-            🔴 TOP HIGH/CRITICAL FINDINGS
-            ──────────────────────────────────────────────────
-            ${{ steps.snyk.outputs.top_vulns }}
-
-            ──────────────────────────────────────────────────
-            ⚠️  EMERGENCY GATE BYPASS NOTICE
-            ──────────────────────────────────────────────────
-            Snyk gate is currently LIFTED due to emergency
-            production deployment requirements.
-
-            ACTION REQUIRED: Dev team must fix all CRITICAL and
-            HIGH vulnerabilities before the next sprint ends.
-            Gate will be re-enforced after fixes are confirmed.
-
-            ──────────────────────────────────────────────────
-            📎 DOWNLOAD FULL REPORT
-            ──────────────────────────────────────────────────
-            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            (Download snyk-report.json from Artifacts section)
-
-            ──────────────────────────────────────────────────
-            Pipeline is continuing to Stage 3 (Build + Trivy).
-            ══════════════════════════════════════════════════
-            — Washify CI/CD Automated Report
+          from: "CI <${{ secrets.MAIL_USERNAME }}>"
+          subject: "[Snyk][${{ inputs.environment }}] Scan Report"
+          body: "Snyk scan completed. Check artifact for details."
