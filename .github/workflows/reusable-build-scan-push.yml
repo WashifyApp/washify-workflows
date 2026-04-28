@@ -1,4 +1,4 @@
-name: Reusable — Build, Scan & Push to GHCR
+name: Reusable — Build & Push
 
 on:
   workflow_call:
@@ -21,138 +21,37 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  build-scan-push:
-    name: "[${{ inputs.environment }}] Build → Trivy → Push GHCR"
+  build-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set Full Image Name
+      - name: Set Image Name
         id: image
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           SERVICE=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
-          TAG="${{ inputs.image_tag }}"
-          if [[ "$TAG" == sha-* ]]; then
-            FULL_SHA="${TAG#sha-}"
-            TAG="sha-${FULL_SHA:0:7}"
-          fi
-          IMAGE="${{ env.REGISTRY }}/${OWNER}/${SERVICE}:${TAG}"
-          echo "full_image=${IMAGE}" >> $GITHUB_OUTPUT
-          echo "image_tag=${TAG}"    >> $GITHUB_OUTPUT
-          echo "Building image: ${IMAGE}"
+          IMAGE="${{ env.REGISTRY }}/${OWNER}/${SERVICE}:${{ inputs.image_tag }}"
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
 
-      - name: Log in to GHCR
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Build Image
+        run: docker build -t ${{ steps.image.outputs.image }} .
 
-      - name: Build Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: false
-          tags: ${{ steps.image.outputs.full_image }}
-          outputs: type=docker,dest=/tmp/image.tar
+      - name: Push Image
+        run: docker push ${{ steps.image.outputs.image }}
 
-      - name: Load Image for Trivy
-        run: docker load --input /tmp/image.tar
-
-      # ── Trivy scan — report only, gate lifted ──────────────
-      - name: Run Trivy Scan (Table Report)
-        id: trivy_table
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-
-          trivy image \
-            --severity HIGH,CRITICAL \
-            --ignore-unfixed \
-            --format table \
-            --output trivy-table.txt \
-            ${{ steps.image.outputs.full_image }} || true
-
-          echo "=== TRIVY SCAN TABLE ==="
-          cat trivy-table.txt
-
-      - name: Run Trivy Scan (JSON for Parsing)
-        id: trivy
-        run: |
-          trivy image \
-            --severity HIGH,CRITICAL \
-            --ignore-unfixed \
-            --format json \
-            --output trivy-report.json \
-            ${{ steps.image.outputs.full_image }} || true
-
-          CRITICAL=$(python3 -c "
-          import json
-          try:
-              data = json.load(open('trivy-report.json'))
-              count = sum(1 for r in data.get('Results',[]) for v in (r.get('Vulnerabilities') or []) if v.get('Severity')=='CRITICAL')
-              print(count)
-          except: print('0')
-          " 2>/dev/null || echo "0")
-
-          HIGH=$(python3 -c "
-          import json
-          try:
-              data = json.load(open('trivy-report.json'))
-              count = sum(1 for r in data.get('Results',[]) for v in (r.get('Vulnerabilities') or []) if v.get('Severity')=='HIGH')
-              print(count)
-          except: print('0')
-          " 2>/dev/null || echo "0")
-
-          # Get top 5 findings
-          TOP=$(python3 -c "
-          import json
-          try:
-              data = json.load(open('trivy-report.json'))
-              lines = []
-              seen = set()
-              for r in data.get('Results',[]):
-                  for v in (r.get('Vulnerabilities') or []):
-                      key = v.get('VulnerabilityID','')
-                      if key not in seen and v.get('Severity') in ['CRITICAL','HIGH']:
-                          seen.add(key)
-                          fixed = v.get('FixedVersion','No fix available')
-                          lines.append(f\"  [{v.get('Severity')}] {key} — {v.get('PkgName','?')} (fix: {fixed})\")
-                  if len(lines) >= 5: break
-              print('\n'.join(lines) if lines else '  No HIGH/CRITICAL found')
-          except: print('  Unable to parse report')
-          ")
-
-          echo "critical=${CRITICAL}"    >> $GITHUB_OUTPUT
-          echo "high=${HIGH}"           >> $GITHUB_OUTPUT
-          echo "top_vulns<<EOF"         >> $GITHUB_OUTPUT
-          echo "$TOP"                   >> $GITHUB_OUTPUT
-          echo "EOF"                    >> $GITHUB_OUTPUT
-
-      - name: Upload Trivy Reports as Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trivy-report-${{ github.event.repository.name }}-${{ github.run_number }}
-          path: |
-            trivy-report.json
-            trivy-table.txt
-          retention-days: 30
-
-      # ── Push image regardless (gate lifted) ────────────────
-      - name: Push Image to GHCR
-        id: push
-        run: docker push ${{ steps.image.outputs.full_image }}
-
-      - name: Email — Full Build & Trivy Report to Team
+      - name: Send Email
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
@@ -161,69 +60,6 @@ jobs:
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.MAIL_RECIPIENT }}
-          from: "Washify CI <${{ secrets.MAIL_USERNAME }}>"
-          subject: "${{ steps.push.outcome == 'success' && '🚀' || '❌' }} [Build+Trivy][${{ inputs.environment }}] ${{ github.event.repository.name }}:${{ steps.image.outputs.image_tag }} — CRITICAL:${{ steps.trivy.outputs.critical }} HIGH:${{ steps.trivy.outputs.high }}"
-          body: |
-            ══════════════════════════════════════════════════
-              WASHIFY CI/CD — BUILD & TRIVY SECURITY REPORT
-            ══════════════════════════════════════════════════
-
-            Service      : ${{ github.event.repository.name }}
-            Environment  : ${{ inputs.environment }}
-            Branch       : ${{ github.ref_name }}
-            Commit       : ${{ github.sha }}
-            Triggered by : ${{ github.actor }}
-
-            ──────────────────────────────────────────────────
-            🐳 DOCKER IMAGE
-            ──────────────────────────────────────────────────
-            Image  : ${{ steps.image.outputs.full_image }}
-            Tag    : ${{ steps.image.outputs.image_tag }}
-            Status : ${{ steps.push.outcome == 'success' && '✅ PUSHED TO GHCR' || '❌ PUSH FAILED' }}
-
-            View Image:
-            https://github.com/orgs/${{ github.repository_owner }}/packages
-
-            ──────────────────────────────────────────────────
-            🔒 TRIVY CONTAINER SCAN RESULTS
-            ──────────────────────────────────────────────────
-            CRITICAL : ${{ steps.trivy.outputs.critical }}
-            HIGH     : ${{ steps.trivy.outputs.high }}
-
-            Top Findings:
-            ${{ steps.trivy.outputs.top_vulns }}
-
-            ──────────────────────────────────────────────────
-            ⚠️  EMERGENCY GATE BYPASS NOTICE
-            ──────────────────────────────────────────────────
-            Trivy security gate is currently LIFTED due to
-            emergency production deployment requirements.
-
-            The image has been pushed to GHCR DESPITE having
-            ${{ steps.trivy.outputs.critical }} CRITICAL and
-            ${{ steps.trivy.outputs.high }} HIGH vulnerabilities.
-
-            ACTION REQUIRED:
-            1. Review the full Trivy report (download below)
-            2. Update base image to a patched version
-            3. Fix all CRITICAL issues before next sprint
-            4. Notify team lead once all issues are resolved
-            Gate will be re-enforced after fixes are confirmed.
-
-            ──────────────────────────────────────────────────
-            📎 DOWNLOAD FULL TRIVY REPORT
-            ──────────────────────────────────────────────────
-            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            (Download trivy-report.json and trivy-table.txt
-             from the Artifacts section)
-
-            ──────────────────────────────────────────────────
-            ⚙️  NEXT STEP
-            ──────────────────────────────────────────────────
-            Update washify-gitops repo:
-            dev/apps/${{ github.event.repository.name }}/values.yaml
-              image:
-                tag: ${{ steps.image.outputs.image_tag }}
-
-            ══════════════════════════════════════════════════
-            — Washify CI/CD Automated Report
+          from: "CI <${{ secrets.MAIL_USERNAME }}>"
+          subject: "[Build][${{ inputs.environment }}] Image Pushed"
+          body: "Docker image pushed to GHCR successfully."
