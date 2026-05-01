@@ -35,7 +35,17 @@ jobs:
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           SERVICE=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE="${{ env.REGISTRY }}/${OWNER}/${SERVICE}:${{ inputs.image_tag }}"
+          
+          INPUT_TAG="${{ inputs.image_tag }}"
+          if [[ "$INPUT_TAG" == sha-* ]]; then
+            SHA_VAL=${INPUT_TAG#sha-}
+            SHORT_SHA=${SHA_VAL:0:7}
+            TAG="sha-$SHORT_SHA"
+          else
+            TAG="$INPUT_TAG"
+          fi
+          
+          IMAGE="${{ env.REGISTRY }}/${OWNER}/${SERVICE}:${TAG}"
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
 
       - name: Login to GHCR
