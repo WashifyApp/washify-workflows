@@ -22,7 +22,7 @@ jobs:
   sonarqube:
     name: "[${{ inputs.environment }}] SonarQube — Scan & Report"
     runs-on: ubuntu-latest
-    continue-on-error: true   # Gate lifted for emergency — remove when fixed
+    continue-on-error: true   
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
